@@ -890,7 +890,11 @@ class AscendMLAImpl(MLAAttentionImpl):
 
     def _v_up_proj(self, x):
         # Convert from (N, B, L)/(N, B, 1, L) to (N, B, L)
-        x = x.view(self.num_heads, -1, self.kv_lora_rank)
+        if self.fa_quant_layer and get_ascend_device_type() == AscendDeviceType.A5:
+            x = x.squeeze(dim=-2) 
+            x = x.permute(1,0,2).contiguous()
+        else:
+            x = x.view(self.num_heads, -1, self.kv_lora_rank)
         # Multiply (N, B, L) x (N, L, V) -> (B, N, V)
         x = torch_npu.npu_transpose_batchmatmul(x, self.W_UV, perm_y=(1, 0, 2))
         # Convert from (B, N, V) to (B, N * V)
