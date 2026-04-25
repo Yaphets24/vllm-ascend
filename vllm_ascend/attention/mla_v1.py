@@ -761,7 +761,7 @@ class AscendMLAImpl(MLAAttentionImpl):
         self.layer_name = kwargs.get("layer_name")
         self.fa_quant_layer = enable_fa_quant(self.vllm_config, self.layer_name)
         if self.fa_quant_layer:
-            self.dtype = torch.float8_e4m3fn if get_ascend_device_type == AscendDeviceType.A5 else torch.int8
+            self.dtype = torch.float8_e4m3fn if get_ascend_device_type() == AscendDeviceType.A5 else torch.int8
         else:
             self.vllm_config.model_config.dtype
         # self.dtype = torch.int8 if self.fa_quant_layer else self.vllm_config.model_config.dtype
@@ -988,9 +988,9 @@ class AscendMLAImpl(MLAAttentionImpl):
                 post_process_after_loading_for_shard_weight_series(layer)
 
     def _process_weights_for_fused_fa_quant(self):
-        if get_ascend_device_type == AscendDeviceType.A5:
+        if get_ascend_device_type() == AscendDeviceType.A5:
             layer = self.vllm_config.compilation_config.static_forward_context[self.layer_name]
-            self.fak_descale_float = layer.fa_kscale
+            self.fak_descale_float = layer.fak_descale_float
         else:
             self.gamma1 = self.q_a_layernorm.weight.data  # type: ignore[union-attr]
             self.gamma2 = self.kv_a_layernorm.weight.data  # type: ignore[union-attr]
@@ -1172,21 +1172,7 @@ class AscendMLAImpl(MLAAttentionImpl):
         for i in range(iters):
             toks = prefill_metadata.chunked_context.seq_tot[i]
             context_seq_len_npu = self.get_context_seq_len_npu(i, attn_metadata)
-            kv_c_normed = torch.empty(toks, num_heads, latent_kv_dim, dtype=q_nope.dtype, device=q_nope.device)
-            k_pe = torch.empty(toks, num_heads, rope_dim, dtype=q_nope.dtype, device=q_nope.device)
-
             if get_ascend_device_type() == AscendDeviceType.A5 and self.fa_quant_layer:
-                dummy_k_pe = torch.empty(toks,
-                               num_heads,
-                               1,
-                               dtype=cache_k_pe.dtype,
-                               device=cache_k_pe.device)
-                dummy_kv_c = torch.empty(toks,
-                                        num_heads,
-                                        1,
-                                        dtype=cache_kv_c.dtype,
-                                        device=cache_kv_c.device)
-
                 kv_c_normed = torch.empty(toks,
                                     num_heads,
                                     latent_kv_dim,
@@ -1197,34 +1183,18 @@ class AscendMLAImpl(MLAAttentionImpl):
                                 rope_dim,
                                 dtype=q_pe.dtype,
                                 device=q_pe.device)
-                torch_npu.npu_gather_pa_kv_cache( ## 替代方案
-                    cache_kv_c,
-                    dummy_kv_c_tensor,
-                    prefill_metadata.block_table,
-                    context_seq_len_npu,
-                    seq_offset=prefill_metadata.chunked_context.starts[i],
-                    key=kv_c_normed,
-                    value=dummy_kv_c,
-                )
-                torch_npu.npu_gather_pa_kv_cache(
-                    cache_k_pe,
-                    dummy_k_pe_tensor,
-                    prefill_metadata.block_table,
-                    context_seq_len_npu,
-                    seq_offset=prefill_metadata.chunked_context.starts[i],
-                    key=k_pe,
-                    value=dummy_k_pe,
-                )
             else:
-                DeviceOperator.mla_cache_load(
-                    cache_kv_c,
-                    cache_k_pe,
-                    prefill_metadata.block_table,
-                    context_seq_len_npu,
-                    prefill_metadata.chunked_context.starts[i],
-                    key=kv_c_normed,
-                    value=k_pe,
-                )
+                kv_c_normed = torch.empty(toks, num_heads, latent_kv_dim, dtype=q_nope.dtype, device=q_nope.device)
+                k_pe = torch.empty(toks, num_heads, rope_dim, dtype=q_nope.dtype, device=q_nope.device)
+            DeviceOperator.mla_cache_load(
+                cache_kv_c,
+                cache_k_pe,
+                prefill_metadata.block_table,
+                context_seq_len_npu,
+                prefill_metadata.chunked_context.starts[i],
+                key=kv_c_normed,
+                value=k_pe,
+            )
             kv_c_normed, k_pe = self._reorg_kvcache(
                 kv_c_normed,
                 k_pe,
@@ -1234,7 +1204,7 @@ class AscendMLAImpl(MLAAttentionImpl):
             )
             kv_c_normed = kv_c_normed.squeeze()
             if self.fa_quant_layer:
-                kv_c_normed = torch.mul(kv_c_normed.to(self.fa_kscale.dtype), self.fa_kscale).to(torch.bfloat16)
+                kv_c_normed = torch.mul(kv_c_normed.to(self.fak_descale_float.dtype), self.fak_descale_float).to(torch.bfloat16)
             kv_nope = self.kv_b_proj(kv_c_normed)[0].view(-1, self.num_heads, self.qk_nope_head_dim + self.v_head_dim)
             k_nope, v = kv_nope.split([self.qk_nope_head_dim, self.v_head_dim], dim=-1)
             k_pe = k_pe.expand((*k_nope.shape[:-1], -1))
@@ -1475,6 +1445,8 @@ class AscendMLAImpl(MLAAttentionImpl):
             actual_seq_lengths = None
             attn_output_shape = (self.num_heads, num_tokens, 1, self.kv_lora_rank)
         elif self.fa_quant_layer:
+            q_nope = q_nope.view(num_tokens, self.num_heads, 1, -1).contiguous()
+            q_pe = q_pe.view(num_tokens, self.num_heads, 1, -1)
             q_nope, dequant_scale_q_nope = torch_npu.npu_dynamic_quant(q_nope,dst_type=torch.float8_e4m3fn)
             q_pe = (q_pe / dequant_scale_q_nope.unsqueeze(-1) / self.fak_descale_float).to(torch.bfloat16)
             attn_mask = None
