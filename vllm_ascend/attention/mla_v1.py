@@ -1116,6 +1116,7 @@ class AscendMLAImpl(MLAAttentionImpl):
             layer = self.vllm_config.compilation_config.static_forward_context[self.layer_name]
             self.quant_kscale = layer.quant_kscale
             self.fak_descale_float = layer.fak_descale_float
+            self.fak_descale_reciprocal = layer.fak_descale_reciprocal
 
     def get_context_seq_len_npu(self, index: int, attn_metadata: AscendMLAMetadata):
         prefill_metadata = attn_metadata.prefill
@@ -1331,7 +1332,7 @@ class AscendMLAImpl(MLAAttentionImpl):
             slots.to(torch.int64),
             kv_cache[1],
             kv_cache[0],
-            c_kv_scale = 1.0 / self.fak_descale_float if self.fa_quant_layer else None,
+            c_kv_scale = self.fak_descale_reciprocal if self.fa_quant_layer else None,
             epsilon=self.kv_a_layernorm.variance_epsilon,  # type: ignore[union-attr]
             cache_mode=cache_mode,
         )
@@ -1360,7 +1361,7 @@ class AscendMLAImpl(MLAAttentionImpl):
             slots.to(torch.int64),
             kv_cache[1],
             kv_cache[0],
-            c_kv_scale = 1.0 / self.fak_descale_float if self.fa_quant_layer else None,
+            c_kv_scale = self.fak_descale_reciprocal if self.fa_quant_layer else None,
             epsilon=self.kv_a_layernorm.variance_epsilon,  # type: ignore[union-attr]
             cache_mode=cache_mode,
             is_output_kv=True,
