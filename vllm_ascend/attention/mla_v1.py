@@ -1157,8 +1157,6 @@ class AscendMLAImpl(MLAAttentionImpl):
         cache_k_pe = kv_c_and_k_pe_cache[1]
         num_heads = cache_k_pe.size(2)
         latent_kv_dim = kv_c_and_k_pe_cache[0].size(-1)
-        dummy_kv_c_tensor = torch.zeros([cache_kv_c.shape[0],cache_kv_c.shape[1],cache_kv_c.shape[2],1],device="npu").to(cache_kv_c.dtype)
-        dummy_k_pe_tensor = torch.zeros([cache_k_pe.shape[0],cache_k_pe.shape[1],cache_k_pe.shape[2],1],device="npu").to(cache_k_pe.dtype)
 
         actual_seq_lengths_q = prefill_metadata.actual_seq_lengths_q
 

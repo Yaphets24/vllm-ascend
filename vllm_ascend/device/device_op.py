@@ -570,7 +570,7 @@ class A5DeviceAdaptor(BaseDeviceAdaptor):
         decode_k_nope, decode_k_pe = kv_cache[0], kv_cache[1]
         if atten_obj.fa_quant_layer:
             decode_q_nope, decode_q_pe, dequant_scale_q_nope,_,_ = torch_npu.npu_mla_prolog_v3(
-                token_x=hidden_states_after,
+                token_x=hidden_states,
                 weight_dq=atten_obj.weight_dq,
                 weight_uq_qr=atten_obj.weight_uq_qr,
                 weight_uk=atten_obj.W_UK_T,
