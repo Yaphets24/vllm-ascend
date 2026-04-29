@@ -991,6 +991,8 @@ class AscendMLAImpl(MLAAttentionImpl):
         if get_ascend_device_type() == AscendDeviceType.A5:
             layer = self.vllm_config.compilation_config.static_forward_context[self.layer_name]
             self.fak_descale_float = layer.fak_descale_float
+            self.quant_kscale = layer.quant_kscale
+            self.fak_descale_reciprocal = layer.fak_descale_reciprocal
         else:
             self.gamma1 = self.q_a_layernorm.weight.data  # type: ignore[union-attr]
             self.gamma2 = self.kv_a_layernorm.weight.data  # type: ignore[union-attr]
@@ -1110,6 +1112,10 @@ class AscendMLAImpl(MLAAttentionImpl):
         weight_scale = weight_scale.reshape(-1, weight_scale.shape[1] * weight_scale.shape[2])
         self.weight_dq_scale = weight_scale[: self.q_lora_rank, ...]
         self.weight_dkv_kr_scale = weight_scale[self.q_lora_rank :, ...]
+        if self.fa_quant_layer:
+            layer = self.vllm_config.compilation_config.static_forward_context[self.layer_name]
+            self.quant_kscale = layer.quant_kscale
+            self.fak_descale_float = layer.fak_descale_float
 
     def get_context_seq_len_npu(self, index: int, attn_metadata: AscendMLAMetadata):
         prefill_metadata = attn_metadata.prefill
@@ -1447,8 +1453,6 @@ class AscendMLAImpl(MLAAttentionImpl):
         elif self.fa_quant_layer:
             q_nope = q_nope.view(num_tokens, self.num_heads, 1, -1).contiguous()
             q_pe = q_pe.view(num_tokens, self.num_heads, 1, -1)
-            q_nope, dequant_scale_q_nope = torch_npu.npu_dynamic_quant(q_nope,dst_type=torch.float8_e4m3fn)
-            q_pe = (q_pe / dequant_scale_q_nope.unsqueeze(-1) / self.fak_descale_float).to(torch.bfloat16)
             attn_mask = None
             input_layout = "BNSD"
             sparse_mode = 0
@@ -1704,7 +1708,7 @@ class AscendMLAImpl(MLAAttentionImpl):
         o_proj_input = torch.empty(o_proj_input_shape, dtype=hidden_states.dtype, device=hidden_states.device)
 
         # MLA Preprocess
-        if (get_ascend_device_type() != AscendDeviceType.A5 and self.fa_quant_layer) or (self.enable_mlapo and attn_metadata.num_decode_tokens <= MLAPO_MAX_SUPPORTED_TOKENS and attn_metadata.num_prefills == 0):
+        if (self.fa_quant_layer or self.enable_mlapo) and (attn_metadata.num_decode_tokens <= MLAPO_MAX_SUPPORTED_TOKENS and attn_metadata.num_prefills == 0):
             hidden_states = torch.ops.vllm.maybe_all_gather_and_maybe_unpad(
                 hidden_states.contiguous(), need_gather_q_kv
             )
