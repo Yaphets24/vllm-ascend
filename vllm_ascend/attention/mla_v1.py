@@ -30,8 +30,6 @@ from vllm_ascend.attention.utils import (
     enabling_mlapo,
     maybe_save_kv_layer_to_connector,
     split_decodes_and_prefills,
-    trans_rope_weight,
-    transdata,
     wait_for_kv_layer_from_connector,
 )
 from vllm_ascend.compilation.acl_graph import (
@@ -42,6 +40,7 @@ from vllm_ascend.compilation.acl_graph import (
     update_graph_params_workspaces,
 )
 from vllm_ascend.device.device_op import DeviceOperator
+from vllm_ascend.device.mla_device_op import MLAPO_MAX_SUPPORTED_TOKENS, MLADeviceOperator
 from vllm_ascend.ops.layer_shard_linear import (
     is_hidden_layer,
     post_process_after_loading_for_shard_weight_series,
@@ -54,8 +53,6 @@ from vllm_ascend.quantization.methods.w8a8_static import AscendW8A8LinearMethod
 from vllm_ascend.quantization.utils import enable_fa_quant
 from vllm_ascend.utils import (
     ACL_FORMAT_FRACTAL_ND,
-    AscendDeviceType,
-    get_ascend_device_type,
     get_weight_prefetch_method,
     maybe_trans_nz,
     weak_ref_tensors,
@@ -69,8 +66,6 @@ if TYPE_CHECKING:
 MAX_O_PROJ_PREFETCH_SIZE = 16 * 1024 * 1024
 BUILD_METADATA_STEP_PREFILL = 0
 BUILD_METADATA_STEP_DECODE = 1
-# token count limits within the mlapo operator
-MLAPO_MAX_SUPPORTED_TOKENS = 1024
 
 
 class AscendMLABackend(AttentionBackend):
@@ -760,7 +755,7 @@ class AscendMLAImpl(MLAAttentionImpl):
         self.layer_name = kwargs.get("layer_name")
         self.fa_quant_layer = enable_fa_quant(self.vllm_config, self.layer_name)
         if self.fa_quant_layer:
-            self.dtype = torch.float8_e4m3fn if get_ascend_device_type() == AscendDeviceType.A5 else torch.int8
+            self.dtype = MLADeviceOperator.FA_QUANT_ACT_DTYPE
         else:
             self.dtype = self.vllm_config.model_config.dtype
         self.layer_sharding_kwargs = []
@@ -969,12 +964,9 @@ class AscendMLAImpl(MLAAttentionImpl):
                     "thus mlapo is disabled for these layers."
                 )
         if self.enable_mlapo:
-            if get_ascend_device_type() == AscendDeviceType.A5:
-                self._process_weights_for_fused_mlapo_a5(act_dtype)
-            else:
-                self._process_weights_for_fused_mlapo(act_dtype)
+            MLADeviceOperator.process_weights_for_fused_mlapo(self, act_dtype)
         elif self.fa_quant_layer:
-            self._process_weights_for_fused_fa_quant()
+            MLADeviceOperator.process_weights_for_fa_quant(self)
         else:
             # if mlapo, W_UK_T can't trans nz
             self.W_UK_T = maybe_trans_nz(self.W_UK_T)
@@ -982,129 +974,6 @@ class AscendMLAImpl(MLAAttentionImpl):
         for layer in self.layer_sharding_kwargs or []:
             if is_hidden_layer(layer):
                 post_process_after_loading_for_shard_weight_series(layer)
-
-    def _process_weights_for_fused_fa_quant(self):
-        if get_ascend_device_type() == AscendDeviceType.A5:
-            layer = self.vllm_config.compilation_config.static_forward_context[self.layer_name]
-            self.fak_descale_float = layer.fak_descale_float
-            self.quant_kscale = layer.quant_kscale
-            self.fak_descale_reciprocal = layer.fak_descale_reciprocal
-        else:
-            self.gamma1 = self.q_a_layernorm.weight.data  # type: ignore[union-attr]
-            self.gamma2 = self.kv_a_layernorm.weight.data  # type: ignore[union-attr]
-            wu_q = self.q_proj.weight.data
-            self.wu_q = wu_q
-            q_a_proj_fa3 = self.fused_qkv_a_proj.weight.data[..., : self.q_lora_rank].contiguous()  # type: ignore[union-attr]
-            self.wd_q = q_a_proj_fa3
-            kv_a_proj_fa3 = self.fused_qkv_a_proj.weight.data[..., self.q_lora_rank :].contiguous()  # type: ignore[union-attr]
-            self.wd_kv = kv_a_proj_fa3
-            self.dequant_scale_w_uq_qr = self.q_proj.weight_scale.data.view(1, -1).to(torch.float)
-            q_a_proj_deq_scl = self.fused_qkv_a_proj.weight_scale[: self.q_lora_rank].contiguous()  # type: ignore[union-attr]
-            self.dequant_scale_w_dq = q_a_proj_deq_scl.view(1, -1).to(torch.float)
-            kv_a_proj_deq_scl = self.fused_qkv_a_proj.weight_scale[self.q_lora_rank :].contiguous()  # type: ignore[union-attr]
-            self.dequant_scale_w_dkv_kr = kv_a_proj_deq_scl.view(1, -1).to(torch.float)
-            layer = self.vllm_config.compilation_config.static_forward_context[self.layer_name]
-            self.quant_kscale = layer.quant_kscale
-            self.fak_descale_float = layer.fak_descale_float
-
-    def _process_weights_for_fused_mlapo(self, act_dtype: torch.dtype):
-        assert self.fused_qkv_a_proj is not None
-        assert self.q_a_layernorm is not None
-        assert self.kv_a_layernorm is not None
-        kv_a_proj_wt = self.fused_qkv_a_proj.weight.data[..., self.q_lora_rank :].contiguous()
-        q_a_proj_wt = self.fused_qkv_a_proj.weight.data[..., : self.q_lora_rank].contiguous()
-        kv_a_proj_wt = kv_a_proj_wt.t().contiguous()
-        kv_a_proj_wt = trans_rope_weight(kv_a_proj_wt, self.qk_rope_head_dim)
-        kv_a_proj_wt = kv_a_proj_wt.t().contiguous()
-        wd_qkv = torch.cat((kv_a_proj_wt, q_a_proj_wt), dim=-1)
-        wd_qkv = wd_qkv.t().contiguous()
-        wd_qkv = transdata(wd_qkv, block_size=(16, 32)).unsqueeze(0).contiguous()
-        self.wd_qkv = torch_npu.npu_format_cast(wd_qkv, 29)
-
-        kv_a_proj_deq_scl = self.fused_qkv_a_proj.deq_scale[self.q_lora_rank :].contiguous()  # type: ignore[union-attr]
-        q_a_proj_deq_scl = self.fused_qkv_a_proj.deq_scale[: self.q_lora_rank].contiguous()  # type: ignore[union-attr]
-        kv_a_proj_deq_scl = kv_a_proj_deq_scl.reshape(self.kv_lora_rank + self.qk_rope_head_dim, -1).contiguous()
-        kv_a_proj_deq_scl = trans_rope_weight(kv_a_proj_deq_scl, self.qk_rope_head_dim)
-        kv_a_proj_deq_scl = kv_a_proj_deq_scl.view(self.kv_lora_rank + self.qk_rope_head_dim).contiguous()
-        self.deq_scale_qkv = torch.cat((kv_a_proj_deq_scl, q_a_proj_deq_scl), dim=-1).contiguous()
-
-        kv_a_proj_qt_bias = self.fused_qkv_a_proj.quant_bias[self.q_lora_rank :].contiguous()  # type: ignore[union-attr]
-        q_a_proj_qt_bias = self.fused_qkv_a_proj.quant_bias[: self.q_lora_rank].contiguous()  # type: ignore[union-attr]
-        kv_a_proj_qt_bias = kv_a_proj_qt_bias.reshape(self.kv_lora_rank + self.qk_rope_head_dim, -1).contiguous()
-        kv_a_proj_qt_bias = trans_rope_weight(kv_a_proj_qt_bias, self.qk_rope_head_dim)
-        kv_a_proj_qt_bias = kv_a_proj_qt_bias.view(self.kv_lora_rank + self.qk_rope_head_dim).contiguous()
-        self.quant_bias_qkv = torch.cat((kv_a_proj_qt_bias, q_a_proj_qt_bias), dim=-1).contiguous()
-
-        wu_q = self.q_proj.weight.data
-        wu_q = wu_q.t().reshape(self.num_heads, self.qk_nope_head_dim + self.qk_rope_head_dim, -1)
-        wu_q = trans_rope_weight(wu_q, self.qk_rope_head_dim)
-        wu_q = wu_q.reshape(self.num_heads * (self.qk_nope_head_dim + self.qk_rope_head_dim), -1)
-        wu_q = transdata(wu_q, block_size=(16, 32)).unsqueeze(0).contiguous()
-        self.wu_q = torch_npu.npu_format_cast(wu_q, 29)
-
-        qb_deq_scl = self.q_proj.deq_scale.data
-        qb_deq_scl = qb_deq_scl.reshape(self.num_heads, self.qk_nope_head_dim + self.qk_rope_head_dim, -1)
-        qb_deq_scl = trans_rope_weight(qb_deq_scl, self.qk_rope_head_dim)
-        self.qb_deq_scl = qb_deq_scl.reshape(self.num_heads * (self.qk_nope_head_dim + self.qk_rope_head_dim))
-
-        qb_qt_bias = self.q_proj.quant_bias.data
-        qb_qt_bias = qb_qt_bias.reshape(self.num_heads, self.qk_nope_head_dim + self.qk_rope_head_dim, -1)
-        qb_qt_bias = trans_rope_weight(qb_qt_bias, self.qk_rope_head_dim)
-        self.qb_qt_bias = qb_qt_bias.reshape(self.num_heads * (self.qk_nope_head_dim + self.qk_rope_head_dim))
-
-        device = self.q_proj.weight.device
-        self.gamma1 = self.q_a_layernorm.weight.data  # type: ignore[union-attr]
-        self.beta1 = torch.zeros_like(self.gamma1) if (_bias := self.q_a_layernorm.bias) is None else _bias.data  # type: ignore[union-attr]
-        self.gamma2 = self.kv_a_layernorm.weight.data  # type: ignore[union-attr]
-        self.quant_scale0 = self.fused_qkv_a_proj.input_scale.data  # type: ignore[union-attr]
-        self.quant_offset0 = self.fused_qkv_a_proj.input_offset.data  # type: ignore[union-attr]
-        self.quant_scale1 = self.q_proj.input_scale.data
-        self.quant_offset1 = self.q_proj.input_offset.data
-        self.ctkv_scale = torch.tensor([1], dtype=act_dtype, device=device)
-        self.q_nope_scale = torch.tensor([1], dtype=act_dtype, device=device)
-
-        # On KV consumers (decode-only) MLAPO uses the transformed weights built above;
-        # the original fused_qkv_a_proj/q_proj weights and quant params are no longer
-        # referenced, so drop them to save memory.
-        if (
-            self.vllm_config.kv_transfer_config is not None
-            and self.vllm_config.kv_transfer_config.is_kv_consumer
-            and self.vllm_config.scheduler_config.max_num_batched_tokens <= MLAPO_MAX_SUPPORTED_TOKENS
-        ):
-            self.fused_qkv_a_proj.weight = None  # type: ignore[union-attr]
-            self.fused_qkv_a_proj.deq_scale = None  # type: ignore[union-attr]
-            self.fused_qkv_a_proj.quant_bias = None  # type: ignore[union-attr]
-            self.q_proj.weight = None
-            self.q_proj.deq_scale = None
-            self.q_proj.quant_bias = None
-            torch.npu.empty_cache()
-
-    def _process_weights_for_fused_mlapo_a5(self, act_dtype: torch.dtype):
-        assert self.fused_qkv_a_proj is not None
-
-        weight_dq = self.fused_qkv_a_proj.weight.data[..., : self.q_lora_rank].contiguous()
-        self.weight_dq = torch_npu.npu_format_cast(weight_dq, 29)
-
-        weight_uq_qr = self.q_proj.weight.data.contiguous()
-        self.weight_uq_qr_scale = self.q_proj.weight_scale.data.transpose(0, 1)
-        self.weight_uq_qr_scale = self.weight_uq_qr_scale.reshape(
-            -1, self.weight_uq_qr_scale.shape[1] * self.weight_uq_qr_scale.shape[2]
-        )
-        self.weight_uq_qr = torch_npu.npu_format_cast(weight_uq_qr, 29)
-
-        weight_dkv_kr = self.fused_qkv_a_proj.weight.data[..., self.q_lora_rank :].contiguous()
-        self.weight_dkv_kr = torch_npu.npu_format_cast(weight_dkv_kr, 29)
-
-        weight_scale = self.fused_qkv_a_proj.weight_scale
-        weight_scale = weight_scale.transpose(0, 1)
-        weight_scale = weight_scale.reshape(-1, weight_scale.shape[1] * weight_scale.shape[2])
-        self.weight_dq_scale = weight_scale[: self.q_lora_rank, ...]
-        self.weight_dkv_kr_scale = weight_scale[self.q_lora_rank :, ...]
-        if self.fa_quant_layer:
-            layer = self.vllm_config.compilation_config.static_forward_context[self.layer_name]
-            self.quant_kscale = layer.quant_kscale
-            self.fak_descale_float = layer.fak_descale_float
-            self.fak_descale_reciprocal = layer.fak_descale_reciprocal
 
     def get_context_seq_len_npu(self, index: int, attn_metadata: AscendMLAMetadata):
         prefill_metadata = attn_metadata.prefill
@@ -1165,14 +1034,9 @@ class AscendMLAImpl(MLAAttentionImpl):
         for i in range(iters):
             toks = prefill_metadata.chunked_context.seq_tot[i]
             context_seq_len_npu = self.get_context_seq_len_npu(i, attn_metadata)
-            if get_ascend_device_type() == AscendDeviceType.A5 and self.fa_quant_layer:
-                kv_c_normed = torch.empty(
-                    toks, num_heads, latent_kv_dim, dtype=cache_kv_c.dtype, device=cache_kv_c.device
-                )
-                k_pe = torch.empty(toks, num_heads, rope_dim, dtype=q_pe.dtype, device=q_pe.device)
-            else:
-                kv_c_normed = torch.empty(toks, num_heads, latent_kv_dim, dtype=q_nope.dtype, device=q_nope.device)
-                k_pe = torch.empty(toks, num_heads, rope_dim, dtype=q_nope.dtype, device=q_nope.device)
+            kv_c_normed, k_pe = MLADeviceOperator.make_chunked_kv_buffers(
+                self, toks, num_heads, latent_kv_dim, rope_dim, cache_kv_c, q_nope, q_pe
+            )
 
             DeviceOperator.kv_cache_load(
                 cache_kv_c,
@@ -1191,10 +1055,7 @@ class AscendMLAImpl(MLAAttentionImpl):
                 toks=toks,
             )
             kv_c_normed = kv_c_normed.squeeze()
-            if self.fa_quant_layer and get_ascend_device_type() == AscendDeviceType.A5:
-                kv_c_normed = torch.mul(kv_c_normed.to(self.fak_descale_float.dtype), self.fak_descale_float).to(
-                    torch.bfloat16
-                )
+            kv_c_normed = MLADeviceOperator.maybe_dequant_chunked_kv_c(self, kv_c_normed)
             kv_nope = self.kv_b_proj(kv_c_normed)[0].view(-1, self.num_heads, self.qk_nope_head_dim + self.v_head_dim)
             k_nope, v = kv_nope.split([self.qk_nope_head_dim, self.v_head_dim], dim=-1)
             k_pe = k_pe.expand((*k_nope.shape[:-1], -1))
@@ -1307,9 +1168,7 @@ class AscendMLAImpl(MLAAttentionImpl):
         # npu_kv_rmsnorm_rope_cache needs [B, N, S, D]
         kv_no_split = kv_no_split.view(B, N, S, self.kv_lora_rank + self.qk_rope_head_dim)
         cache_mode = "PA_NZ" if self.enable_kv_nz else "PA"
-        c_kv_scale = None
-        if get_ascend_device_type() == AscendDeviceType.A5 and self.fa_quant_layer:
-            c_kv_scale = self.fak_descale_reciprocal
+        c_kv_scale = MLADeviceOperator.get_kv_rmsnorm_rope_scale(self)
         k_pe, k_nope, _, _ = torch_npu.npu_kv_rmsnorm_rope_cache(
             kv_no_split,
             self.kv_a_layernorm.weight,  # type: ignore[union-attr]
@@ -1339,9 +1198,7 @@ class AscendMLAImpl(MLAAttentionImpl):
         # npu_kv_rmsnorm_rope_cache needs [B, N, S, D]
         kv_no_split = kv_no_split.view(B, N, S, self.kv_lora_rank + self.qk_rope_head_dim)
         cache_mode = "PA"
-        c_kv_scale = None
-        if get_ascend_device_type() == AscendDeviceType.A5 and self.fa_quant_layer:
-            c_kv_scale = self.fak_descale_reciprocal
+        c_kv_scale = MLADeviceOperator.get_kv_rmsnorm_rope_scale(self)
         _, _, k_pe, k_nope = torch_npu.npu_kv_rmsnorm_rope_cache(
             kv_no_split,
             self.kv_a_layernorm.weight,  # type: ignore[union-attr]
@@ -1385,25 +1242,9 @@ class AscendMLAImpl(MLAAttentionImpl):
         # shape of knope/k_pe for npu graph mode should be:
         # [num_blocks, num_kv_heads, block_size, self.kv_lora_rank/self.qk_rope_head_dim]
         actual_seq_lengths = None
-        if self.fa_quant_layer and get_ascend_device_type() != AscendDeviceType.A5:
-            nz_fmt_last_dim = 16
-            k_nope = k_nope.view(
-                -1, self.num_kv_heads, self.kv_lora_rank // (nz_fmt_last_dim * 2), block_size, nz_fmt_last_dim * 2
-            )
-            k_pe = k_pe.view(
-                -1, self.num_kv_heads, self.qk_rope_head_dim // nz_fmt_last_dim, block_size, nz_fmt_last_dim
-            )
-        elif self.enable_kv_nz:
-            nz_fmt_last_dim = 16
-            k_nope = k_nope.view(
-                -1, self.num_kv_heads, self.kv_lora_rank // nz_fmt_last_dim, block_size, nz_fmt_last_dim
-            )
-            k_pe = k_pe.view(
-                -1, self.num_kv_heads, self.qk_rope_head_dim // nz_fmt_last_dim, block_size, nz_fmt_last_dim
-            )
-        else:
-            k_nope = k_nope.view(-1, self.num_kv_heads, block_size, self.kv_lora_rank)
-            k_pe = k_pe.view(-1, self.num_kv_heads, block_size, self.qk_rope_head_dim)
+        k_nope, k_pe = MLADeviceOperator.reshape_decode_kv_for_attn(
+            self, k_nope, k_pe, block_size, self.enable_kv_nz
+        )
 
         attn_output_shape: tuple | None = None
         if (
@@ -1431,24 +1272,19 @@ class AscendMLAImpl(MLAAttentionImpl):
             actual_seq_lengths = decode_meta.actual_seq_lengths_q
             if self.fa_quant_layer:
                 dequant_scale_q_nope = dequant_scale_q_nope.view(num_tokens, self.num_heads)
-        elif self.fa_quant_layer and get_ascend_device_type() != AscendDeviceType.A5:
-            attn_mask = None
-            input_layout = "BSND_NBSD"
-            q_nope = q_nope.view(num_tokens, 1, self.num_heads, -1).contiguous()
-            q_pe = q_pe.view(num_tokens, 1, self.num_heads, -1).contiguous()
-            dequant_scale_q_nope = dequant_scale_q_nope.view(num_tokens, 1, self.num_heads)
-            sparse_mode = 0
-            actual_seq_lengths = None
-            attn_output_shape = (self.num_heads, num_tokens, 1, self.kv_lora_rank)
-        elif self.fa_quant_layer and get_ascend_device_type() == AscendDeviceType.A5:
-            q_nope = q_nope.view(num_tokens, self.num_heads, 1, -1).contiguous()
-            q_pe = q_pe.view(num_tokens, self.num_heads, 1, -1)
-            dequant_scale_q_nope = dequant_scale_q_nope.view(num_tokens, self.num_heads, 1)
-            attn_mask = None
-            input_layout = "BNSD"
-            sparse_mode = 0
-            actual_seq_lengths = None
-            attn_output_shape = (num_tokens, self.num_heads, 1, self.kv_lora_rank)
+        elif self.fa_quant_layer:
+            (
+                q_nope,
+                q_pe,
+                dequant_scale_q_nope,
+                input_layout,
+                attn_mask,
+                sparse_mode,
+                actual_seq_lengths,
+                attn_output_shape,
+            ) = MLADeviceOperator.configure_decode_fa_quant_layout(
+                self, q_nope, q_pe, dequant_scale_q_nope, num_tokens
+            )
         else:
             # The output layout is set to NBSD to eliminate the need for a
             # transpose operation after attention.
@@ -1589,12 +1425,9 @@ class AscendMLAImpl(MLAAttentionImpl):
         sin = attn_metadata.decode.sin
         decode_ql_nope, decode_q_pe = self._q_proj_and_k_up_proj(decode_q_c)
         decode_q_pe = self.rope_single(decode_q_pe, cos, sin)
-        dequant_scale_q_nope = None
-        if self.fa_quant_layer and get_ascend_device_type() == AscendDeviceType.A5:
-            decode_ql_nope, dequant_scale_q_nope = torch_npu.npu_dynamic_quant(
-                decode_ql_nope, dst_type=torch.float8_e4m3fn
-            )
-            decode_q_pe = (decode_q_pe / dequant_scale_q_nope.unsqueeze(-1) / self.fak_descale_float).to(torch.bfloat16)
+        decode_ql_nope, decode_q_pe, dequant_scale_q_nope = MLADeviceOperator.quantize_decode_q(
+            self, decode_ql_nope, decode_q_pe
+        )
         decode_slots = attn_metadata.slot_mapping[:num_decode_tokens:1]
         decode_kv_no_split = kv_no_split[:num_decode_tokens]
         decode_k_pe, decode_k_nope = self.exec_kv_decode(decode_kv_no_split, cos, sin, kv_cache, decode_slots)
