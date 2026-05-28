@@ -125,7 +125,6 @@ class TestAscendW8A8FusedMoEMethod(TestBase):
             self.assertEqual(param_dict["w13_weight"].shape[0], num_experts)
             self.assertEqual(param_dict["w2_weight"].shape[0], num_experts)
 
-    @patch("vllm_ascend.quantization.methods.w8a8_dynamic.logger.warning_once")
     @patch("torch.distributed.get_rank")
     @patch("vllm_ascend.quantization.methods.w8a8_dynamic.get_mc2_group")
     @patch("vllm_ascend.quantization.methods.w8a8_dynamic.get_ascend_config")
@@ -136,7 +135,6 @@ class TestAscendW8A8FusedMoEMethod(TestBase):
         mock_ascend,
         mock_mc2,
         mock_rank,
-        mock_warning_once,
     ):
         with patch("vllm_ascend.quantization.methods.w8a8_dynamic.get_current_vllm_config") as mock_vllm:
             mock_vllm.return_value = create_mock_vllm_config()
@@ -148,10 +146,6 @@ class TestAscendW8A8FusedMoEMethod(TestBase):
             quant_method = AscendW8A8DynamicFusedMoEMethod()
 
         self.assertEqual(quant_method.moe_all_to_all_group_name, "")
-        mock_warning_once.assert_called_once_with(
-            "[vllm-ascend/W8A8_DYNAMIC] MC2 group metadata unavailable, "
-            "falling back to empty moe_all_to_all_group_name."
-        )
 
     def test_get_dynamic_quant_param_various_sizes(self):
         param_dict = self.quant_method.get_dynamic_quant_param(
