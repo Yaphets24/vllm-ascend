@@ -214,6 +214,26 @@ class TestAscendW8A8FusedMoEMethod(TestBase):
         self.assertIs(fused_experts_input.topk_weights, topk_weights)
         self.assertIs(fused_experts_input.topk_ids, topk_ids)
 
+    @patch("vllm_ascend.quantization.methods.w8a8_dynamic.get_moe_num_logical_experts")
+    def test_apply_raises_when_router_logits_expert_dim_mismatches(self, mock_get_num_logical_experts):
+        layer = Mock()
+        layer.zero_expert_num = 0
+        layer.zero_expert_type = None
+        layer.n_shared_experts = 0
+        mock_get_num_logical_experts.return_value = 8
+
+        x = torch.randn(4, self.hidden_size, dtype=torch.float32)
+        router_logits = torch.randn(4, 7, dtype=torch.float32)
+
+        self.quant_method.apply(
+            layer=layer,
+            x=x,
+            router_logits=router_logits,
+            top_k=2,
+            renormalize=True,
+            num_experts=8,
+        )
+
     @patch("torch_npu.npu_format_cast")
     @patch("vllm_ascend.quantization.methods.w8a8_dynamic.get_ascend_config")
     def test_process_weights_after_loading(self, mock_get_config, mock_format_cast):
