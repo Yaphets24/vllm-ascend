@@ -234,6 +234,33 @@ class TestAscendW8A8FusedMoEMethod(TestBase):
             num_experts=8,
         )
 
+    @patch("vllm_ascend.quantization.methods.w8a8_dynamic.get_flash_common3_context")
+    @patch("vllm_ascend.quantization.methods.w8a8_dynamic.get_moe_num_logical_experts")
+    def test_apply_raises_when_flash_common3_context_is_missing_without_shared_experts(
+        self,
+        mock_get_num_logical_experts,
+        mock_get_flash_common3_context,
+    ):
+        layer = Mock()
+        layer.zero_expert_num = 0
+        layer.zero_expert_type = None
+        layer.n_shared_experts = 0
+        mock_get_num_logical_experts.return_value = 8
+        mock_get_flash_common3_context.return_value = None
+        self.quant_method.multistream_overlap_gate = True
+
+        x = torch.randn(4, self.hidden_size, dtype=torch.float32)
+        router_logits = torch.randn(4, 8, dtype=torch.float32)
+
+        self.quant_method.apply(
+            layer=layer,
+            x=x,
+            router_logits=router_logits,
+            top_k=2,
+            renormalize=True,
+            num_experts=8,
+        )
+
     @patch("torch_npu.npu_format_cast")
     @patch("vllm_ascend.quantization.methods.w8a8_dynamic.get_ascend_config")
     def test_process_weights_after_loading(self, mock_get_config, mock_format_cast):
